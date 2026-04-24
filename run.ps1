@@ -228,7 +228,7 @@ if ($Duration -gt 0) {
 
 # ── Launch tshark as a background process ─────────────────────
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
-$psi.FileName               = (Get-Command tshark).Source
+$psi.FileName               = "A:\Program Files\Wireshark\tshark.exe"  # Adjust if tshark is in PATH or different location
 $psi.Arguments              = $tsharkArgs -join " "
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError  = $true
