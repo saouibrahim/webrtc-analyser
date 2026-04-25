@@ -233,3 +233,4 @@ By using this tool, you agree that the author shall not be held liable or respon
 ## License
 
 MIT — free to use, modify, and share.
+
