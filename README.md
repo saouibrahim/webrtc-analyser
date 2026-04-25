@@ -10,17 +10,17 @@ A pair of scripts (**Bash** + **PowerShell**) that capture live network traffic,
 
 | File | Platform |
 |---|---|
-| `stun_scanner.sh` | Linux / macOS (Bash) |
-| `stun_scanner.ps1` | Windows (PowerShell) |
+| `run.sh` | Linux / macOS (Bash) |
+| `run.ps1` | Windows (PowerShell) |
 
 ---
 
 ## How it works
 
-1. **TShark** sniffs live traffic and filters only `stun` protocol packets
+1. **TShark** sniffs WebRTC / STUN live traffic protocol packets
 2. The script reads TShark output line by line in real time
 3. It automatically identifies and **excludes**:
-   - Your own public IP (`stun.xor_mapped_address` — the XOR-MAPPED-ADDRESS the STUN server echoes back)
+   - Your own public IP (curl ipinfo.io to check you public ip address)
    - The STUN server IP itself (auto-detected from packet direction)
    - All private/RFC-1918/loopback/multicast ranges
    - Any extra IPs you provide via an exclusion file
@@ -99,22 +99,22 @@ Use the **number** (e.g. `6`) that corresponds to your active network adapter (u
 
 ```bash
 # Make the script executable (first time only)
-chmod +x stun_scanner.sh
+chmod +x run.sh
 
 # Basic — capture on wlan0
-sudo ./stun_scanner.sh -i wlan0
+sudo ./run.sh -i wlan0
 
 # With a custom exclusion file
-sudo ./stun_scanner.sh -i wlan0 -e excluded.txt
+sudo ./run.sh -i wlan0 -e excluded.txt
 
 # Auto-stop after 2 minutes
-sudo ./stun_scanner.sh -i wlan0 -t 120
+sudo ./run.sh -i wlan0 -t 120
 
 # All options together
-sudo ./stun_scanner.sh -i wlan0 -e excluded.json -t 120
+sudo ./run.sh -i wlan0 -e excluded.json -t 120
 
 # Show help
-./stun_scanner.sh -h
+./run.sh -h
 ```
 
 ### Windows — PowerShell
@@ -124,19 +124,19 @@ sudo ./stun_scanner.sh -i wlan0 -e excluded.json -t 120
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 # Basic — interface index 6
-.\stun_scanner.ps1 -Interface 6
+.\run.ps1 -Interface 6
 
 # With a custom exclusion file
-.\stun_scanner.ps1 -Interface 6 -ExclFile excluded.txt
+.\run.ps1 -Interface 6 -ExclFile excluded.txt
 
 # Auto-stop after 2 minutes
-.\stun_scanner.ps1 -Interface 6 -Duration 120
+.\run.ps1 -Interface 6 -Duration 120
 
 # All options together
-.\stun_scanner.ps1 -Interface 6 -ExclFile excluded.json -Duration 120
+.\run.ps1 -Interface 6 -ExclFile excluded.json -Duration 120
 
 # Show help
-.\stun_scanner.ps1 -Help
+.\run.ps1 -Help
 ```
 
 > **Note for Windows:** TShark requires **Npcap** (installed automatically with Wireshark) to capture packets. If you get a permission error, run PowerShell **as Administrator**.
@@ -151,7 +151,6 @@ Both scripts run the following TShark command internally:
 tshark -i <interface> -l -Y "stun" -T fields
        -e ip.src
        -e ip.dst
-       -e stun.xor_mapped_address
        -e stun.att.ipv4
        -E separator=|
 ```
@@ -164,7 +163,6 @@ tshark -i <interface> -l -Y "stun" -T fields
 | `-T fields` | Output only specific fields, not full packet info |
 | `-e ip.src` | Source IP of each packet |
 | `-e ip.dst` | Destination IP of each packet |
-| `-e stun.xor_mapped_address` | The XOR-MAPPED-ADDRESS attribute — your own public IP echoed by the STUN server |
 | `-e stun.att.ipv4` | Raw MAPPED-ADDRESS or peer-reflexive candidate — may contain peer IP |
 | `-E separator=\|` | Separate fields with a pipe character for easy parsing |
 
@@ -210,17 +208,25 @@ The following are always excluded regardless of your exclusion file:
 - `169.254.x.x` — link-local
 - `224–235.x.x.x` — multicast
 - `0.0.0.0` and `255.255.255.255`
-- Your own public IP (auto-detected from XOR-MAPPED-ADDRESS)
+- Your own public IP (auto-detected from curl ipinfo.io)
 - The STUN server IP (auto-detected from packet direction)
 
 ---
 
 ## Tips
 
-- Start your WebRTC call (Google Meet, Discord, etc.) **after** launching the script so the STUN handshake is captured from the beginning.
+- Start your WebRTC call **after** launching the script so the STUN handshake is captured from the beginning.
 - If you only see STUN server IPs and no peer IPs, the call may be using a **TURN relay** — in that case only the relay server's IP is visible in traffic, not the peer's.
 - Use `-t 120` to capture a fixed window instead of running indefinitely.
 - The script deduplicates: each peer IP is only looked up **once** per session.
+
+---
+
+## Disclaimer
+
+This tool is provided strictly for educational and research purposes only. It is intended to help users understand network protocols and traffic analysis concepts.
+The author does not encourage, condone, or support any illegal, unethical, or unauthorized use of this tool. Users are solely responsible for ensuring that their use complies with all applicable laws and regulations.
+By using this tool, you agree that the author shall not be held liable or responsible for any misuse, damage, or legal consequences arising from its use.
 
 ---
 
