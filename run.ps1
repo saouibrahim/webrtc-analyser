@@ -1,27 +1,387 @@
+# # ============================================================
+# #  run.ps1
+# #  Live WebRTC/STUN capture - extracts PEER IPs in real time,
+# #  auto-skips STUN servers, then queries ipinfo.io for each
+# #  new peer found.
+# #
+# #  Usage:
+# #    .\run.ps1 [OPTIONS]
+# #
+# #  Options:
+# #    -Interface  <id|name>   TShark interface index or name  (default: 1)
+# #    -ExclFile   <path>      Exclusion list (.txt or .json)  (optional)
+# #    -Duration   <sec>       Auto-stop after N seconds       (default: 0 = forever)
+# #    -Help                   Show this help
+# #
+# #  Fields used from tshark:
+# #    ip.src         - source IP of each STUN packet
+# #    ip.dst         - destination IP of each STUN packet
+# #    stun.att.ipv4  - mapped-address attribute (peer reflexive candidate)
+# # ============================================================
+
+# param(
+#     [string]$Interface = "1",
+#     [string]$ExclFile  = "",
+#     [int]   $Duration  = 0,
+#     [switch]$Help
+# )
+
+# # ── Help ─────────────────────────────────────────────────────
+# if ($Help) {
+#     Write-Host "run.ps1 - Live WebRTC peer IP extractor + ipinfo lookup"
+#     Write-Host ""
+#     Write-Host "Usage:  .\run.ps1 [OPTIONS]"
+#     Write-Host ""
+#     Write-Host "  -Interface <id|name>   TShark interface index or name   (default: 1)"
+#     Write-Host "  -ExclFile  <path>      Exclusion list (.txt or .json)   (optional)"
+#     Write-Host "  -Duration  <sec>       Auto-stop after N seconds        (default: 0 = unlimited)"
+#     Write-Host "  -Help                  Show this help"
+#     Write-Host ""
+#     Write-Host "Tip - list your TShark interfaces:  tshark -D"
+#     exit 0
+# }
+
+# # ── Colour helpers ────────────────────────────────────────────
+# function Write-Log  { param([string]$msg) Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $msg" -ForegroundColor Cyan }
+# function Write-Warn { param([string]$msg) Write-Host "[!] $msg" -ForegroundColor Yellow }
+# function Write-Err  { param([string]$msg) Write-Host "[-] $msg" -ForegroundColor Red }
+# function Write-Ok   { param([string]$msg) Write-Host "[+] $msg" -ForegroundColor Green }
+
+# # ── Built-in exclusions (private/reserved ranges) ─────────────
+# $BuiltinExcluded = @(
+#     "0.0.0.0",
+#     "127.",
+#     "10.",
+#     "172.16.", "172.17.", "172.18.", "172.19.",
+#     "172.20.", "172.21.", "172.22.", "172.23.",
+#     "172.24.", "172.25.", "172.26.", "172.27.",
+#     "172.28.", "172.29.", "172.30.", "172.31.",
+#     "192.168.",
+#     "169.254.",
+#     "224.", "225.", "226.", "227.", "228.", "229.",
+#     "230.", "231.", "232.", "233.", "234.", "235.",
+#     "255.255.255.255",
+#     "::1"
+# )
+
+# # ── Load exclusion file ───────────────────────────────────────
+# $FileExcluded = @()
+
+# if ($ExclFile -ne "") {
+#     if (-not (Test-Path $ExclFile)) {
+#         Write-Err "Exclusion file not found: $ExclFile"
+#         exit 1
+#     }
+#     if ($ExclFile -match '\.json$') {
+#         try {
+#             $json = Get-Content $ExclFile -Raw | ConvertFrom-Json
+#             $FileExcluded = $json.excluded
+#         }
+#         catch {
+#             Write-Err "Failed to parse JSON exclusion file: $_"
+#             exit 1
+#         }
+#     }
+#     else {
+#         Get-Content $ExclFile | ForEach-Object {
+#             $line = ($_ -replace '#.*', '').Trim()
+#             if ($line -ne "") { $FileExcluded += $line }
+#         }
+#     }
+#     Write-Log "Loaded $($FileExcluded.Count) exclusion entries from: $ExclFile"
+# }
+
+# $AllExcluded = $BuiltinExcluded + $FileExcluded
+
+# # ── Runtime state ─────────────────────────────────────────────
+# $SeenPeers   = [System.Collections.Generic.List[string]]::new()
+# $StunServers = [System.Collections.Generic.List[string]]::new()
+# $MyPublicIP  = ""   # filled in at startup by querying ipinfo.io
+
+# # ── Dependency check ──────────────────────────────────────────
+# $tsharkExe = Get-Command tshark -ErrorAction SilentlyContinue
+# if (-not $tsharkExe) {
+#     Write-Err "tshark not found. Download Wireshark: https://www.wireshark.org/download.html"
+#     exit 1
+# }
+# $tsharkPath = $tsharkExe.Source
+
+# # ── Step 1: Detect our own public IP via ipinfo.io ────────────
+# # We do this BEFORE starting the capture so our public IP is
+# # excluded from the very first packet.
+# #
+# # Why is this needed?
+# #   STUN works by sending a Binding Request to the STUN server.
+# #   The server replies with a Binding Response that contains your
+# #   public IP in the mapped-address field. That response has:
+# #     ip.src  = STUN server
+# #     ip.dst  = YOUR public IP   <-- this would be mistaken for a peer
+# #   By knowing our public IP upfront, we exclude it immediately.
+
+# Write-Log "Detecting this machine's public IP via ipinfo.io..."
+
+# try {
+#     $myInfo = Invoke-RestMethod -Uri "https://ipinfo.io/json" `
+#                                 -Method Get `
+#                                 -TimeoutSec 6 `
+#                                 -ErrorAction Stop
+
+#     $MyPublicIP = $myInfo.ip
+
+#     Write-Ok "My public IP : $MyPublicIP ($($myInfo.city), $($myInfo.country)) - will be excluded"
+#     Write-Ok "My org       : $($myInfo.org)"
+# }
+# catch {
+#     Write-Warn "Could not reach ipinfo.io to detect public IP: $_"
+#     Write-Warn "Your public IP may appear in results - add it manually to an exclusion file with -ExclFile"
+# }
+
+# # ── Helpers ───────────────────────────────────────────────────
+# function IsExcluded {
+#     param([string]$ip)
+
+#     # Check static built-in + file list
+#     foreach ($excl in $AllExcluded) {
+#         if ($ip.StartsWith($excl)) { return $true }
+#     }
+
+#     # Check our own public IP (detected at startup)
+#     if ($MyPublicIP -ne "" -and $ip -eq $MyPublicIP) { return $true }
+
+#     # Check auto-detected STUN servers
+#     if ($StunServers.Contains($ip)) { return $true }
+
+#     return $false
+# }
+
+# function AlreadySeen { param([string]$ip); return $SeenPeers.Contains($ip) }
+# function AlreadyStun { param([string]$ip); return $StunServers.Contains($ip) }
+
+# function IsPrivateIP {
+#     # Returns true if the IP matches any of the built-in private ranges.
+#     # Used to identify whether ip.src is "us" (private) or "them" (public).
+#     param([string]$ip)
+#     foreach ($excl in $BuiltinExcluded) {
+#         if ($ip.StartsWith($excl)) { return $true }
+#     }
+#     return $false
+# }
+
+# function IsValidIPv4 {
+#     param([string]$ip)
+#     return $ip -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+# }
+
+# # ── ipinfo.io lookup ──────────────────────────────────────────
+# function Invoke-IPLookup {
+#     param([string]$ip)
+#     $SeenPeers.Add($ip)
+
+#     Write-Host ""
+#     Write-Host "[+] Peer found -> " -ForegroundColor Green -NoNewline
+#     Write-Host $ip -ForegroundColor Yellow
+
+#     try {
+#         $response = Invoke-RestMethod -Uri "https://ipinfo.io/$ip/json" `
+#                                       -Method Get `
+#                                       -TimeoutSec 6 `
+#                                       -ErrorAction Stop
+
+#         Write-Host "  IP       : $ip" -ForegroundColor Yellow
+#         if ($response.bogon -eq $true) {
+#             Write-Host "  WARNING: BOGON (private/reserved)" -ForegroundColor Red
+#         }
+#         if ($response.hostname) { Write-Host "  Hostname : $($response.hostname)" }
+#         if ($response.org)      { Write-Host "  Org      : $($response.org)" }
+#         if ($response.city)     { Write-Host "  Location : $($response.city), $($response.region), $($response.country)" }
+#         Write-Host "  Raw JSON : $($response | ConvertTo-Json -Compress)"
+#         Write-Host "------------------------------------------------"
+#     }
+#     catch {
+#         Write-Warn "ipinfo.io returned no data for $ip : $_"
+#     }
+# }
+
+# # ── Process one line of tshark output ────────────────────────
+# # tshark outputs 3 pipe-separated fields per line:
+# #   ip.src | ip.dst | stun.att.ipv4
+# #
+# # STUN server detection logic:
+# #   A STUN Binding Request goes FROM us TO the STUN server.
+# #   So when we see:  src=192.168.x.x (private = us)  dst=X.X.X.X (public)
+# #   ...that destination X.X.X.X is the STUN server.
+# #   We mark it immediately so it never gets looked up as a peer.
+# #
+# #   A STUN Binding Response comes back FROM the STUN server TO us.
+# #   So when we see:  src=X.X.X.X  dst=our public IP
+# #   ...that source is also the STUN server (already excluded by the
+# #   step above, since we marked it when we sent the request).
+
+# function Process-Line {
+#     param([string]$line)
+#     if ([string]::IsNullOrWhiteSpace($line)) { return }
+
+#     $parts   = $line -split '\|', 3
+#     $src     = if ($parts.Count -gt 0) { $parts[0].Trim() } else { "" }
+#     $dst     = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
+#     $stunAtt = if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" }
+
+#     # ── STUN server detection ─────────────────────────────────
+#     # If src is our private IP and dst is a public IP we haven't
+#     # seen yet, dst is the STUN server we're sending a request to.
+#     if ($src -ne "" -and $dst -ne "") {
+#         if ((IsPrivateIP $src) -and (IsValidIPv4 $dst) -and -not (AlreadyStun $dst) -and -not (IsExcluded $dst)) {
+#             $StunServers.Add($dst)
+#             Write-Log "STUN server identified: $dst (we sent a request to it) - excluded"
+#         }
+#     }
+
+#     # ── Peer IP candidates ────────────────────────────────────
+#     # Priority:
+#     #   1. stun.att.ipv4  — explicit peer-reflexive candidate from STUN attribute
+#     #   2. ip.src         — source of the packet
+#     #   3. ip.dst         — destination of the packet
+#     $candidates = [System.Collections.Generic.List[string]]::new()
+#     if ($stunAtt -ne "") { $candidates.Add($stunAtt) }
+#     if ($src     -ne "") { $candidates.Add($src) }
+#     if ($dst     -ne "") { $candidates.Add($dst) }
+
+#     foreach ($ip in $candidates) {
+#         if (-not (IsValidIPv4 $ip)) { continue }
+#         if (IsExcluded  $ip)        { continue }   # private, our IP, or STUN server
+#         if (AlreadySeen $ip)        { continue }   # already looked up
+#         Invoke-IPLookup $ip
+#     }
+# }
+
+# function Write-Summary {
+#     Write-Host ""
+#     Write-Host "============= Session summary ===============" -ForegroundColor Cyan
+#     Write-Host "  My public IP (excluded) : $MyPublicIP"
+#     Write-Host "  STUN servers (excluded) : $($StunServers.Count)"
+#     foreach ($s in $StunServers) { Write-Host "    - $s" }
+#     Write-Host "  Peers discovered        : $($SeenPeers.Count)"
+#     foreach ($p in $SeenPeers) { Write-Host "    - $p" }
+#     Write-Host "=============================================" -ForegroundColor Cyan
+# }
+
+# # ── Banner ────────────────────────────────────────────────────
+# Write-Host ""
+# Write-Host "  +=========================================+" -ForegroundColor Cyan
+# Write-Host "  |   WebRTC / STUN Live Peer IP Scanner   |" -ForegroundColor Cyan
+# Write-Host "  +=========================================+" -ForegroundColor Cyan
+# Write-Host ""
+# Write-Log "Interface        : $Interface"
+# Write-Log "Exclusion entries: $($AllExcluded.Count)  (built-in + file)"
+# Write-Log "Auto-stop        : ${Duration}s  (0 = unlimited)"
+# Write-Host "================================================" -ForegroundColor Cyan
+# Write-Host ""
+
+# # ── Build tshark argument string ─────────────────────────────
+# $argList  = "-i `"$Interface`" -l -Y stun -T fields"
+# $argList += " -e ip.src"
+# $argList += " -e ip.dst"
+# $argList += " -e stun.att.ipv4"
+# $argList += " -E separator=|"
+# if ($Duration -gt 0) {
+#     $argList += " -a duration:$Duration"
+# }
+
+# # ── Temp files ───────────────────────────────────────────────
+# $tmpOut = [System.IO.Path]::GetTempFileName()
+# $tmpErr = [System.IO.Path]::GetTempFileName()
+
+# # ── Launch tshark ─────────────────────────────────────────────
+# $tsharkProc = Start-Process `
+#     -FilePath $tsharkPath `
+#     -ArgumentList $argList `
+#     -RedirectStandardOutput $tmpOut `
+#     -RedirectStandardError  $tmpErr `
+#     -PassThru `
+#     -NoNewWindow
+
+# Write-Log "tshark running (PID $($tsharkProc.Id))"
+
+# Start-Sleep -Milliseconds 800
+
+# if ($tsharkProc.HasExited) {
+#     $errMsg = Get-Content $tmpErr -Raw -ErrorAction SilentlyContinue
+#     Write-Err "tshark exited immediately (code $($tsharkProc.ExitCode))"
+#     if ($errMsg) { Write-Err "tshark said: $errMsg" }
+#     Remove-Item $tmpOut, $tmpErr -ErrorAction SilentlyContinue
+#     exit 1
+# }
+
+# Write-Log "Capture running - start your WebRTC call now..."
+# Write-Host ""
+
+# # ── Tail-read the temp file ───────────────────────────────────
+# $fileStream = [System.IO.FileStream]::new(
+#     $tmpOut,
+#     [System.IO.FileMode]::Open,
+#     [System.IO.FileAccess]::Read,
+#     [System.IO.FileShare]::ReadWrite
+# )
+# $reader   = [System.IO.StreamReader]::new($fileStream)
+# $position = 0L
+
+# try {
+#     while (-not $tsharkProc.HasExited) {
+
+#         # Print any tshark errors immediately
+#         $errContent = Get-Content $tmpErr -Raw -ErrorAction SilentlyContinue
+#         if ($errContent -and $errContent.Trim() -ne "") {
+#             foreach ($errLine in ($errContent -split "`n")) {
+#                 $errLine = $errLine.Trim()
+#                 if ($errLine -ne "") {
+#                     Write-Host "[tshark] $errLine" -ForegroundColor DarkGray
+#                 }
+#             }
+#             Clear-Content $tmpErr -ErrorAction SilentlyContinue
+#         }
+
+#         # Read new lines
+#         $fileStream.Position = $position
+#         $line = $reader.ReadLine()
+
+#         if ($null -ne $line) {
+#             $position = $fileStream.Position
+#             Process-Line $line
+#         }
+#         else {
+#             Start-Sleep -Milliseconds 200
+#         }
+#     }
+
+#     # Drain remaining lines after tshark exits
+#     $fileStream.Position = $position
+#     while ($null -ne ($line = $reader.ReadLine())) {
+#         Process-Line $line
+#     }
+# }
+# finally {
+#     $reader.Close()
+#     $fileStream.Close()
+#     try { $tsharkProc.Kill() } catch {}
+#     Remove-Item $tmpOut, $tmpErr -ErrorAction SilentlyContinue
+#     Write-Summary
+# }
+
+
 # ============================================================
-#  stun_scanner.ps1
-#  Live WebRTC/STUN capture — extracts PEER IPs in real time,
-#  auto-skips STUN servers and XOR-MAPPED-ADDRESS (your own
-#  public IP), then queries ipinfo.io for each new peer found.
+#  run.ps1
+#  Live WebRTC/STUN capture - extracts PEER IPs in real time,
+#  auto-skips STUN servers, then queries ipinfo.io for each
+#  new peer found.
 #
 #  Usage:
-#    .\stun_scanner.ps1 [OPTIONS]
+#    .\run.ps1 [OPTIONS]
 #
 #  Options:
 #    -Interface  <id|name>   TShark interface index or name  (default: 1)
 #    -ExclFile   <path>      Exclusion list (.txt or .json)  (optional)
 #    -Duration   <sec>       Auto-stop after N seconds       (default: 0 = forever)
 #    -Help                   Show this help
-#
-#  Exclusion file formats
-#  ──────────────────────
-#  TXT  — one IP or prefix per line; lines starting with # are comments
-#    # Google STUN servers
-#    74.125.
-#    8.8.8.8
-#
-#  JSON — array under the key "excluded"
-#    { "excluded": ["74.125.", "8.8.8.8"] }
 # ============================================================
 
 param(
@@ -33,56 +393,26 @@ param(
 
 # ── Help ─────────────────────────────────────────────────────
 if ($Help) {
-    Write-Host @"
-stun_scanner.ps1 — Live WebRTC peer IP extractor + ipinfo lookup
-
-if powershell blocks execution, run : 
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-
-Usage:
-  .\stun_scanner.ps1 [OPTIONS]
-
-Options:
-  -Interface <id|name>   TShark interface index or name   (default: 1)
-  -ExclFile  <path>      Exclusion list (.txt or .json)   (optional)
-  -Duration  <sec>       Auto-stop after N seconds        (default: 0 = unlimited)
-  -Help                  Show this help
-
-How exclusions work (layered):
-  1. Built-in : all private/loopback/multicast ranges — always applied
-  2. File     : your -ExclFile entries (prefixes or exact IPs)
-  3. Auto     : XOR-MAPPED-ADDRESS = your own public IP   -> excluded
-  4. Auto     : destination of your first STUN packet     -> STUN server, excluded
-
-Exclusion file — TXT:
-  # comment
-  74.125.         <- prefix match (entire range)
-  8.8.8.8         <- exact match
-
-Exclusion file — JSON:
-  { "excluded": ["74.125.", "8.8.8.8"] }
-
-Tip — list your TShark interfaces:
-  tshark -D
-"@
+    Write-Host "run.ps1 - Live WebRTC peer IP extractor + ipinfo lookup"
+    Write-Host ""
+    Write-Host "Usage:  .\run.ps1 [OPTIONS]"
+    Write-Host ""
+    Write-Host "  -Interface <id|name>   TShark interface index or name   (default: 1)"
+    Write-Host "  -ExclFile  <path>      Exclusion list (.txt or .json)   (optional)"
+    Write-Host "  -Duration  <sec>       Auto-stop after N seconds        (default: 0 = unlimited)"
+    Write-Host "  -Help                  Show this help"
+    Write-Host ""
+    Write-Host "Tip - list your TShark interfaces:  tshark -D"
     exit 0
 }
 
 # ── Colour helpers ────────────────────────────────────────────
-function Write-Color {
-    param([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::White)
-    $prev = [Console]::ForegroundColor
-    [Console]::ForegroundColor = $Color
-    Write-Host $Text
-    [Console]::ForegroundColor = $prev
-}
+function Write-Log  { param([string]$msg) Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $msg" -ForegroundColor Cyan }
+function Write-Warn { param([string]$msg) Write-Host "[!] $msg" -ForegroundColor Yellow }
+function Write-Err  { param([string]$msg) Write-Host "[-] $msg" -ForegroundColor Red }
+function Write-Ok   { param([string]$msg) Write-Host "[+] $msg" -ForegroundColor Green }
 
-function Log  ($msg) { Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $msg" -ForegroundColor Cyan }
-function Ok   ($msg) { Write-Host "[+] $msg" -ForegroundColor Green }
-function Warn  ($msg) { Write-Host "[!] $msg" -ForegroundColor Yellow }
-function Err  ($msg) { Write-Host "[-] $msg" -ForegroundColor Red }
-
-# ── Built-in exclusions ───────────────────────────────────────
+# ── Built-in exclusions (private/reserved ranges) ─────────────
 $BuiltinExcluded = @(
     "0.0.0.0",
     "127.",
@@ -104,69 +434,92 @@ $FileExcluded = @()
 
 if ($ExclFile -ne "") {
     if (-not (Test-Path $ExclFile)) {
-        Err "Exclusion file not found: $ExclFile"
+        Write-Err "Exclusion file not found: $ExclFile"
         exit 1
     }
-
     if ($ExclFile -match '\.json$') {
         try {
             $json = Get-Content $ExclFile -Raw | ConvertFrom-Json
             $FileExcluded = $json.excluded
-        } catch {
-            Err "Failed to parse JSON exclusion file: $_"
+        }
+        catch {
+            Write-Err "Failed to parse JSON exclusion file: $_"
             exit 1
         }
-    } else {
-        # TXT format
+    }
+    else {
         Get-Content $ExclFile | ForEach-Object {
-            $line = $_ -replace '#.*', ''   # strip comments
-            $line = $line.Trim()
+            $line = ($_ -replace '#.*', '').Trim()
             if ($line -ne "") { $FileExcluded += $line }
         }
     }
-
-    Log "Loaded $($FileExcluded.Count) exclusion entries from: $ExclFile"
+    Write-Log "Loaded $($FileExcluded.Count) exclusion entries from: $ExclFile"
 }
 
-# Merge all static exclusions
 $AllExcluded = $BuiltinExcluded + $FileExcluded
 
 # ── Runtime state ─────────────────────────────────────────────
-$SeenPeers    = [System.Collections.Generic.List[string]]::new()
-$StunServers  = [System.Collections.Generic.List[string]]::new()
-$MyPublicIP   = ""
+$SeenPeers      = [System.Collections.Generic.List[string]]::new()
+$StunServers    = [System.Collections.Generic.List[string]]::new()
+$SeenErrLines   = [System.Collections.Generic.HashSet[string]]::new()  # dedup tshark stderr
+$MyPublicIP     = ""
 
 # ── Dependency check ──────────────────────────────────────────
-if (-not (Get-Command tshark -ErrorAction SilentlyContinue)) {
-    Err "tshark not found. Download Wireshark (includes tshark): https://www.wireshark.org/download.html"
+$tsharkExe = Get-Command tshark -ErrorAction SilentlyContinue
+if (-not $tsharkExe) {
+    Write-Err "tshark not found. Download Wireshark: https://www.wireshark.org/download.html"
     exit 1
 }
+$tsharkPath = $tsharkExe.Source
 
-# ── Exclusion helpers ─────────────────────────────────────────
-function IsExcluded([string]$ip) {
+# ── Detect our own public IP at startup ───────────────────────
+Write-Log "Detecting this machine's public IP via ipinfo.io..."
+
+try {
+    $myInfo = Invoke-RestMethod -Uri "https://ipinfo.io/json" `
+                                -Method Get `
+                                -TimeoutSec 6 `
+                                -ErrorAction Stop
+
+    $MyPublicIP = $myInfo.ip
+    Write-Ok "My public IP : $MyPublicIP ($($myInfo.city), $($myInfo.country)) - excluded"
+    Write-Ok "My org       : $($myInfo.org)"
+}
+catch {
+    Write-Warn "Could not reach ipinfo.io to detect public IP: $_"
+    Write-Warn "Your public IP may appear in results - add it manually via -ExclFile"
+}
+
+# ── Helpers ───────────────────────────────────────────────────
+function IsExcluded {
+    param([string]$ip)
     foreach ($excl in $AllExcluded) {
         if ($ip.StartsWith($excl)) { return $true }
     }
     if ($MyPublicIP -ne "" -and $ip -eq $MyPublicIP) { return $true }
-    if ($StunServers.Contains($ip))                   { return $true }
+    if ($StunServers.Contains($ip)) { return $true }
     return $false
 }
 
-function AlreadySeen([string]$ip) {
-    return $SeenPeers.Contains($ip)
+function AlreadySeen  { param([string]$ip); return $SeenPeers.Contains($ip) }
+function AlreadyStun  { param([string]$ip); return $StunServers.Contains($ip) }
+
+function IsPrivateIP {
+    param([string]$ip)
+    foreach ($excl in $BuiltinExcluded) {
+        if ($ip.StartsWith($excl)) { return $true }
+    }
+    return $false
 }
 
-function AlreadyStun([string]$ip) {
-    return $StunServers.Contains($ip)
-}
-
-# ── IPv4 validation ───────────────────────────────────────────
-function IsValidIPv4([string]$ip) {
+function IsValidIPv4 {
+    param([string]$ip)
     return $ip -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
 }
 
 # ── ipinfo.io lookup ──────────────────────────────────────────
-function Invoke-IPLookup([string]$ip) {
+function Invoke-IPLookup {
+    param([string]$ip)
     $SeenPeers.Add($ip)
 
     Write-Host ""
@@ -174,148 +527,183 @@ function Invoke-IPLookup([string]$ip) {
     Write-Host $ip -ForegroundColor Yellow
 
     try {
-        # ── the curl equivalent: Invoke-RestMethod calls ipinfo.io ──
         $response = Invoke-RestMethod -Uri "https://ipinfo.io/$ip/json" `
                                       -Method Get `
                                       -TimeoutSec 6 `
                                       -ErrorAction Stop
-        # ────────────────────────────────────────────────────────────
 
-        Write-Host "  IP       : $ip"          -ForegroundColor Yellow
+        Write-Host "  IP       : $ip" -ForegroundColor Yellow
         if ($response.bogon -eq $true) {
-            Write-Host "  !! BOGON (private/reserved — should not appear here)" -ForegroundColor Red
+            Write-Host "  WARNING: BOGON (private/reserved)" -ForegroundColor Red
         }
         if ($response.hostname) { Write-Host "  Hostname : $($response.hostname)" }
         if ($response.org)      { Write-Host "  Org      : $($response.org)" }
         if ($response.city)     { Write-Host "  Location : $($response.city), $($response.region), $($response.country)" }
-
         Write-Host "  Raw JSON : $($response | ConvertTo-Json -Compress)"
-        Write-Host "────────────────────────────────────────────────"
-
-    } catch {
-        Warn "ipinfo.io returned no data for $ip ($_)"
+        Write-Host "------------------------------------------------"
     }
+    catch {
+        Write-Warn "ipinfo.io returned no data for $ip : $_"
+    }
+}
+
+# ── Process one line of tshark output ────────────────────────
+function Process-Line {
+    param([string]$line)
+    if ([string]::IsNullOrWhiteSpace($line)) { return }
+
+    $parts   = $line -split '\|', 3
+    $src     = if ($parts.Count -gt 0) { $parts[0].Trim() } else { "" }
+    $dst     = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
+    $stunAtt = if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" }
+
+    # STUN server detection:
+    # When src is our private IP and dst is a new public IP,
+    # we are sending a Binding Request → dst is the STUN server.
+    if ($src -ne "" -and $dst -ne "") {
+        if ((IsPrivateIP $src) -and (IsValidIPv4 $dst) -and -not (AlreadyStun $dst) -and -not (IsExcluded $dst)) {
+            $StunServers.Add($dst)
+            Write-Log "STUN server identified: $dst (we sent a request to it) - excluded"
+        }
+    }
+
+    # Peer IP candidates
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if ($stunAtt -ne "") { $candidates.Add($stunAtt) }
+    if ($src     -ne "") { $candidates.Add($src) }
+    if ($dst     -ne "") { $candidates.Add($dst) }
+
+    foreach ($ip in $candidates) {
+        if (-not (IsValidIPv4 $ip)) { continue }
+        if (IsExcluded  $ip)        { continue }
+        if (AlreadySeen $ip)        { continue }
+        Invoke-IPLookup $ip
+    }
+}
+
+# ── Print tshark stderr — deduplicated ────────────────────────
+# tshark writes "Capturing on 'Wi-Fi'" repeatedly to stderr.
+# We use a HashSet to track which lines we have already printed
+# and silently drop any line we have seen before.
+# Real errors (field names, permission issues) are always new
+# lines so they still get through.
+function Print-StderrOnce {
+    param([string]$errFilePath)
+
+    $errContent = Get-Content $errFilePath -Raw -ErrorAction SilentlyContinue
+    if (-not $errContent -or $errContent.Trim() -eq "") { return }
+
+    foreach ($errLine in ($errContent -split "`n")) {
+        $errLine = $errLine.Trim()
+        if ($errLine -eq "") { continue }
+
+        # Only print if we have never seen this exact line before
+        if ($SeenErrLines.Add($errLine)) {
+            Write-Host "[tshark] $errLine" -ForegroundColor DarkGray
+        }
+    }
+
+    Clear-Content $errFilePath -ErrorAction SilentlyContinue
+}
+
+function Write-Summary {
+    Write-Host ""
+    Write-Host "============= Session summary ===============" -ForegroundColor Cyan
+    Write-Host "  My public IP (excluded) : $MyPublicIP"
+    Write-Host "  STUN servers (excluded) : $($StunServers.Count)"
+    foreach ($s in $StunServers) { Write-Host "    - $s" }
+    Write-Host "  Peers discovered        : $($SeenPeers.Count)"
+    foreach ($p in $SeenPeers) { Write-Host "    - $p" }
+    Write-Host "=============================================" -ForegroundColor Cyan
 }
 
 # ── Banner ────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "  ╔═════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "  ║   WebRTC / STUN Live Peer IP Scanner    ║" -ForegroundColor Cyan
-Write-Host "  ╚═════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host "  +=========================================+" -ForegroundColor Cyan
+Write-Host "  |   WebRTC / STUN Live Peer IP Scanner   |" -ForegroundColor Cyan
+Write-Host "  +=========================================+" -ForegroundColor Cyan
 Write-Host ""
-Log "Interface        : $Interface"
-Log "Exclusion entries: $($AllExcluded.Count)  (built-in + file)"
-Log "Auto-stop        : ${Duration}s  (0 = unlimited)"
-Log "Waiting for STUN traffic — start your WebRTC call now..."
-Write-Host "═══════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Log "Interface        : $Interface"
+Write-Log "Exclusion entries: $($AllExcluded.Count)  (built-in + file)"
+Write-Log "Auto-stop        : ${Duration}s  (0 = unlimited)"
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host ""
 
-# ── Build tshark arguments ────────────────────────────────────
-$tsharkArgs = @(
-    "-i", $Interface,
-    "-l",
-    "-Y",  "stun",
-    "-T",  "fields",
-    "-e",  "ip.src",
-    "-e",  "ip.dst",
-    "-e",  "stun.xor_mapped_address",
-    "-e",  "stun.att.ipv4",
-    "-E",  "separator=|"
-)
-
+# ── Build tshark argument string ─────────────────────────────
+$argList  = "-i `"$Interface`" -l -Y stun -T fields"
+$argList += " -e ip.src"
+$argList += " -e ip.dst"
+$argList += " -e stun.att.ipv4"
+$argList += " -E separator=|"
 if ($Duration -gt 0) {
-    $tsharkArgs += @("-a", "duration:$Duration")
+    $argList += " -a duration:$Duration"
 }
 
-# ── Launch tshark as a background process ─────────────────────
-$psi = [System.Diagnostics.ProcessStartInfo]::new()
-$psi.FileName               = "A:\Program Files\Wireshark\tshark.exe"  # Adjust if tshark is in PATH or different location
-$psi.Arguments              = $tsharkArgs -join " "
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError  = $true
-$psi.UseShellExecute        = $false
-$psi.CreateNoWindow         = $true
+# ── Temp files ───────────────────────────────────────────────
+$tmpOut = [System.IO.Path]::GetTempFileName()
+$tmpErr = [System.IO.Path]::GetTempFileName()
 
-$tsharkProcess = [System.Diagnostics.Process]::Start($psi)
+# ── Launch tshark ─────────────────────────────────────────────
+$tsharkProc = Start-Process `
+    -FilePath $tsharkPath `
+    -ArgumentList $argList `
+    -RedirectStandardOutput $tmpOut `
+    -RedirectStandardError  $tmpErr `
+    -PassThru `
+    -NoNewWindow
 
-Log "tshark running (PID $($tsharkProcess.Id))"
+Write-Log "tshark running (PID $($tsharkProc.Id))"
+
+Start-Sleep -Milliseconds 800
+
+if ($tsharkProc.HasExited) {
+    $errMsg = Get-Content $tmpErr -Raw -ErrorAction SilentlyContinue
+    Write-Err "tshark exited immediately (code $($tsharkProc.ExitCode))"
+    if ($errMsg) { Write-Err "tshark said: $errMsg" }
+    Remove-Item $tmpOut, $tmpErr -ErrorAction SilentlyContinue
+    exit 1
+}
+
+Write-Log "Capture running - start your WebRTC call now..."
 Write-Host ""
 
-# ── Cleanup on Ctrl+C ─────────────────────────────────────────
-$cleanupBlock = {
-    Write-Host ""
-    Warn "Stopping capture..."
-    try { $tsharkProcess.Kill() } catch {}
-
-    Write-Host ""
-    Write-Host "══════════════ Session summary ══════════════" -ForegroundColor Cyan
-    Write-Host "  My public IP (excluded) : $MyPublicIP"
-    Write-Host "  STUN servers (excluded) : $($StunServers.Count)"
-    foreach ($s in $StunServers) { Write-Host "    • $s" }
-    Write-Host "  Peers discovered        : $($SeenPeers.Count)"
-    foreach ($p in $SeenPeers) { Write-Host "    • $p" }
-    Write-Host "═════════════════════════════════════════════" -ForegroundColor Cyan
-}
-
-# Register Ctrl+C handler
-[Console]::TreatControlCAsInput = $false
-$null = Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action $cleanupBlock
+# ── Tail-read the temp file ───────────────────────────────────
+$fileStream = [System.IO.FileStream]::new(
+    $tmpOut,
+    [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::Read,
+    [System.IO.FileShare]::ReadWrite
+)
+$reader   = [System.IO.StreamReader]::new($fileStream)
+$position = 0L
 
 try {
-    # ── Main loop — read tshark output line by line ───────────
-    while (-not $tsharkProcess.StandardOutput.EndOfStream) {
+    while (-not $tsharkProc.HasExited) {
 
-        $line = $tsharkProcess.StandardOutput.ReadLine()
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        Print-StderrOnce $tmpErr
 
-        $parts      = $line -split '\|', 4
-        $src        = if ($parts.Count -gt 0) { $parts[0].Trim() } else { "" }
-        $dst        = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
-        $xorMapped  = if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" }
-        $stunAtt    = if ($parts.Count -gt 3) { $parts[3].Trim() } else { "" }
+        $fileStream.Position = $position
+        $line = $reader.ReadLine()
 
-        # ── 1. Capture our own public IP from XOR-MAPPED-ADDRESS ──
-        if ($xorMapped -ne "" -and $MyPublicIP -eq "") {
-            $MyPublicIP = $xorMapped
-            Log "My public IP detected (XOR-MAPPED): $MyPublicIP — excluded"
+        if ($null -ne $line) {
+            $position = $fileStream.Position
+            Process-Line $line
         }
-
-        # ── 2. Auto-detect STUN server ─────────────────────────
-        if ($dst -ne "" -and -not (AlreadyStun $dst)) {
-            if ($src -eq $MyPublicIP) {
-                $StunServers.Add($dst)
-                Log "STUN server identified: $dst — excluded"
-            }
-        }
-
-        # ── 3. Collect peer IP candidates ──────────────────────
-        #   Priority:
-        #     • stun.att.ipv4   — explicit mapped/peer-reflexive attribute
-        #     • ip.src / ip.dst — actual packet endpoints
-        #   xor_mapped is NOT included (= our own IP)
-        $candidates = @()
-        if ($stunAtt -ne "") { $candidates += $stunAtt }
-        if ($src     -ne "") { $candidates += $src }
-        if ($dst     -ne "") { $candidates += $dst }
-
-        foreach ($ip in $candidates) {
-            if (-not (IsValidIPv4 $ip))  { continue }
-            if (IsExcluded  $ip)         { continue }
-            if (AlreadySeen $ip)         { continue }
-
-            # New public peer IP found
-            Invoke-IPLookup $ip
+        else {
+            Start-Sleep -Milliseconds 200
         }
     }
-} finally {
-    # tshark exited naturally (duration flag) or loop ended
-    try { $tsharkProcess.Kill() } catch {}
 
-    Write-Host ""
-    Write-Host "══════════════ Session summary ══════════════" -ForegroundColor Cyan
-    Write-Host "  My public IP (excluded) : $MyPublicIP"
-    Write-Host "  STUN servers (excluded) : $($StunServers.Count)"
-    foreach ($s in $StunServers) { Write-Host "    • $s" }
-    Write-Host "  Peers discovered        : $($SeenPeers.Count)"
-    foreach ($p in $SeenPeers) { Write-Host "    • $p" }
-    Write-Host "═════════════════════════════════════════════" -ForegroundColor Cyan
+    # Drain remaining lines after tshark exits
+    $fileStream.Position = $position
+    while ($null -ne ($line = $reader.ReadLine())) {
+        Process-Line $line
+    }
+}
+finally {
+    $reader.Close()
+    $fileStream.Close()
+    try { $tsharkProc.Kill() } catch {}
+    Remove-Item $tmpOut, $tmpErr -ErrorAction SilentlyContinue
+    Write-Summary
 }
