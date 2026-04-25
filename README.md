@@ -2,7 +2,7 @@
 
 A pair of scripts (**Bash** + **PowerShell**) that capture live network traffic, extract peer IP addresses from WebRTC/STUN packets, and query **ipinfo.io** for geolocation and organisation info on each newly discovered peer.
 
-> **School / learning project** — intended to understand how WebRTC peer discovery works at the network level by analysing your own traffic.
+> **learning project** — intended to understand how WebRTC peer discovery works at the network level by analysing your own traffic.
 
 ---
 
