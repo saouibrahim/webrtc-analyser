@@ -1,4 +1,4 @@
-# # ============================================================
+﻿# # ============================================================
 # # 
 # #     /$$$$$$$                        /$$     /$$   /$$                                        
 # #    | $$__  $$                      | $$    | $$  | $$                                        
@@ -31,8 +31,8 @@
 
 param(
     [string]$Interface = "1",
-    [string]$ExclFile  = "",
-    [int]   $Duration  = 0,
+    [string]$ExclFile = "",
+    [int]   $Duration = 0,
     [switch]$Help
 )
 
@@ -52,10 +52,10 @@ if ($Help) {
 }
 
 # ── Colour helpers ────────────────────────────────────────────
-function Write-Log  { param([string]$msg) Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $msg" -ForegroundColor Cyan }
+function Write-Log { param([string]$msg) Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $msg" -ForegroundColor Cyan }
 function Write-Warn { param([string]$msg) Write-Host "[!] $msg" -ForegroundColor Yellow }
-function Write-Err  { param([string]$msg) Write-Host "[-] $msg" -ForegroundColor Red }
-function Write-Ok   { param([string]$msg) Write-Host "[+] $msg" -ForegroundColor Green }
+function Write-Err { param([string]$msg) Write-Host "[-] $msg" -ForegroundColor Red }
+function Write-Ok { param([string]$msg) Write-Host "[+] $msg" -ForegroundColor Green }
 
 # ── Built-in exclusions (private/reserved ranges) ─────────────
 $BuiltinExcluded = @(
@@ -104,10 +104,10 @@ if ($ExclFile -ne "") {
 $AllExcluded = $BuiltinExcluded + $FileExcluded
 
 # ── Runtime state ─────────────────────────────────────────────
-$SeenPeers      = [System.Collections.Generic.List[string]]::new()
-$StunServers    = [System.Collections.Generic.List[string]]::new()
-$SeenErrLines   = [System.Collections.Generic.HashSet[string]]::new()  # dedup tshark stderr
-$MyPublicIP     = ""
+$SeenPeers = [System.Collections.Generic.List[string]]::new()
+$StunServers = [System.Collections.Generic.List[string]]::new()
+$SeenErrLines = [System.Collections.Generic.HashSet[string]]::new()  # dedup tshark stderr
+$MyPublicIP = ""
 
 # ── Dependency check ──────────────────────────────────────────
 $tsharkExe = Get-Command tshark -ErrorAction SilentlyContinue
@@ -122,9 +122,9 @@ Write-Log "Detecting this machine's public IP via ipinfo.io..."
 
 try {
     $myInfo = Invoke-RestMethod -Uri "https://ipinfo.io/json" `
-                                -Method Get `
-                                -TimeoutSec 6 `
-                                -ErrorAction Stop
+        -Method Get `
+        -TimeoutSec 6 `
+        -ErrorAction Stop
 
     $MyPublicIP = $myInfo.ip
     Write-Ok "My public IP : $MyPublicIP ($($myInfo.city), $($myInfo.country)) - excluded"
@@ -146,8 +146,8 @@ function IsExcluded {
     return $false
 }
 
-function AlreadySeen  { param([string]$ip); return $SeenPeers.Contains($ip) }
-function AlreadyStun  { param([string]$ip); return $StunServers.Contains($ip) }
+function AlreadySeen { param([string]$ip); return $SeenPeers.Contains($ip) }
+function AlreadyStun { param([string]$ip); return $StunServers.Contains($ip) }
 
 function IsPrivateIP {
     param([string]$ip)
@@ -173,17 +173,17 @@ function Invoke-IPLookup {
 
     try {
         $response = Invoke-RestMethod -Uri "https://ipinfo.io/$ip/json" `
-                                      -Method Get `
-                                      -TimeoutSec 6 `
-                                      -ErrorAction Stop
+            -Method Get `
+            -TimeoutSec 6 `
+            -ErrorAction Stop
 
         Write-Host "  IP       : $ip" -ForegroundColor Yellow
         if ($response.bogon -eq $true) {
             Write-Host "  WARNING: BOGON (private/reserved)" -ForegroundColor Red
         }
         if ($response.hostname) { Write-Host "  Hostname : $($response.hostname)" }
-        if ($response.org)      { Write-Host "  Org      : $($response.org)" }
-        if ($response.city)     { Write-Host "  Location : $($response.city), $($response.region), $($response.country)" }
+        if ($response.org) { Write-Host "  Org      : $($response.org)" }
+        if ($response.city) { Write-Host "  Location : $($response.city), $($response.region), $($response.country)" }
         Write-Host "  Raw JSON : $($response | ConvertTo-Json -Compress)"
         Write-Host "------------------------------------------------"
     }
@@ -197,9 +197,9 @@ function Process-Line {
     param([string]$line)
     if ([string]::IsNullOrWhiteSpace($line)) { return }
 
-    $parts   = $line -split '\|', 3
-    $src     = if ($parts.Count -gt 0) { $parts[0].Trim() } else { "" }
-    $dst     = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
+    $parts = $line -split '\|', 3
+    $src = if ($parts.Count -gt 0) { $parts[0].Trim() } else { "" }
+    $dst = if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }
     $stunAtt = if ($parts.Count -gt 2) { $parts[2].Trim() } else { "" }
 
     # STUN server detection:
@@ -215,13 +215,13 @@ function Process-Line {
     # Peer IP candidates
     $candidates = [System.Collections.Generic.List[string]]::new()
     if ($stunAtt -ne "") { $candidates.Add($stunAtt) }
-    if ($src     -ne "") { $candidates.Add($src) }
-    if ($dst     -ne "") { $candidates.Add($dst) }
+    if ($src -ne "") { $candidates.Add($src) }
+    if ($dst -ne "") { $candidates.Add($dst) }
 
     foreach ($ip in $candidates) {
         if (-not (IsValidIPv4 $ip)) { continue }
-        if (IsExcluded  $ip)        { continue }
-        if (AlreadySeen $ip)        { continue }
+        if (IsExcluded  $ip) { continue }
+        if (AlreadySeen $ip) { continue }
         Invoke-IPLookup $ip
     }
 }
@@ -289,7 +289,7 @@ Write-Host "================================================" -ForegroundColor C
 Write-Host ""
 
 # ── Build tshark argument string ─────────────────────────────
-$argList  = "-i `"$Interface`" -l -Y stun -T fields"
+$argList = "-i `"$Interface`" -l -Y stun -T fields"
 $argList += " -e ip.src"
 $argList += " -e ip.dst"
 $argList += " -e stun.att.ipv4"
@@ -333,7 +333,7 @@ $fileStream = [System.IO.FileStream]::new(
     [System.IO.FileAccess]::Read,
     [System.IO.FileShare]::ReadWrite
 )
-$reader   = [System.IO.StreamReader]::new($fileStream)
+$reader = [System.IO.StreamReader]::new($fileStream)
 $position = 0L
 
 try {
