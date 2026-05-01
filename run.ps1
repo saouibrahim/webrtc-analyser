@@ -254,6 +254,15 @@ function Write-Summary {
 
 # ── Banner ────────────────────────────────────────────────────
 Write-Host ""
+Write-Host "                                                              " -ForegroundColor Cyan
+Write-Host "  ▄▄▄▄▄▄                    ▄▄▄  ▄▄▄                          " -ForegroundColor Cyan
+Write-Host " █▀██▀▀▀█▄              █▄ █▀██  ██                           " -ForegroundColor Cyan
+Write-Host "   ██▄▄▄█▀             ▄██▄  ██  ██                      ▄    " -ForegroundColor Cyan
+Write-Host "   ██▀▀█▄   ▄███▄ ▄███▄ ██   ██████   ▄█▀█▄▀██ ██▀ ▄█▀█▄ ████▄" -ForegroundColor Cyan
+Write-Host " ▄ ██  ██   ██ ██ ██ ██ ██   ██  ██   ██▄█▀  ███   ██▄█▀ ██   " -ForegroundColor Cyan
+Write-Host " ▀██▀  ▀██▀▄▀███▀▄▀███▀▄██ ▀██▀  ▀██▄▄▀█▄▄▄▄██ ██▄▄▀█▄▄▄▄█▀   " -ForegroundColor Cyan
+Write-Host "                                                              " -ForegroundColor Cyan
+Write-Host "                                                              " -ForegroundColor Cyan
 Write-Host "  +=========================================+" -ForegroundColor Cyan
 Write-Host "  |   WebRTC / STUN Live Peer IP Scanner   |" -ForegroundColor Cyan
 Write-Host "  +=========================================+" -ForegroundColor Cyan
